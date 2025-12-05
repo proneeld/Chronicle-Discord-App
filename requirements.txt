@@ -1,0 +1,6 @@
+
+pytz~=2025.2
+Flask~=3.0.3
+requests
+python-dotenv
+py-cord==2.4.1
