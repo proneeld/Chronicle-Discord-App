@@ -9,3 +9,6 @@ NOTE: THIS IS FOR THE 2025 SEASON ONLY. 2026 SEASON WILL BE UPDATED SHORTLY BEFO
 * Gamble on VCT Tier 1 games using fake money, allowing for a 2x payout if you win and nothing if you lose. Also gives out daily money if a user goes below a certain amount to make it more forgiving
 
 # Videos and Screenshots
+
+# UPDATES
+* 12/04/2025: Code is now uploaded. I have also contacted Liquipedia to be able to use their free version of their API, which is exponentially better than my current API. We shall see if they respond
