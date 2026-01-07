@@ -562,14 +562,15 @@ async def regionranks(ctx: discord.ApplicationContext,
     # 1) Define your whitelists (unchanged) …
     if region_key in ("na", "la", "la-s", "la-n"):
         whitelist = { "100 Thieves","Cloud9","Evil Geniuses","FURIA","KRÜ Esports",
-                      "Leviatán","LOUD","MIBR","NRG","Sentinels","G2 Esports" }
+                      "Leviatán","LOUD","MIBR","NRG","Sentinels","G2 Esports","ENVY"}
     elif region_key == "cn":
         whitelist = { "All Gamers","Bilibili Gaming","EDward Gaming","FunPlus Phoenix",
                       "JDG Esports","Nova Esports","Titan Esports Club","Trace Esports",
                       "TYLOO","Wolves Esports","Dragon Ranger Gaming","Xi Lai Gaming" }
     elif region_key == "eu":
-        whitelist = { "FNATIC","BBL Esports","FUT Esports","Karmine Corp","KOI",
-                      "Natus Vincere","Team Heretics","Team Liquid","Team Vitality","GIANTX" }
+        whitelist = { "FNATIC","BBL Esports","FUT Esports","Karmine Corp","Gentle Mates",
+                      "Natus Vincere","Team Heretics","Team Liquid","Team Vitality","GIANTX",
+                      "ULF Esports", "PCIFIC Espor"}
     elif region_key in ("ap", "kr", "jp"):
         whitelist = { "DetonatioN FocusMe","DRX","Gen.G","Global Esports","Paper Rex",
                       "Rex Regum Qeon","T1","TALON","Team Secret","ZETA DIVISION",
@@ -644,8 +645,10 @@ async def recentmatch_cmd(ctx: discord.ApplicationContext):
         return await ctx.respond("❌ Could not fetch match data.")
 
     events = [
-        "VCT 2025: China Stage 2", "Esports World Cup 2025", "VCT 2025: Pacific Stage 2", "VCT 2025: EMEA Stage 2",
-        "VCT 2025: Americas Stage 2", "Valorant Champions 2025"
+        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
+        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
+        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
+        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
     ]
 
     segments = data["data"]["segments"]
@@ -668,7 +671,7 @@ async def recentmatch_cmd(ctx: discord.ApplicationContext):
     if output_lines:
         await ctx.respond("\n".join(output_lines))
     else:
-        await ctx.respond("❌ No recent results found for 2025 VCT Tier 1 matches.")
+        await ctx.respond("❌ No recent results found for 2026 VCT Tier 1 matches.")
     return None
 
 
@@ -680,8 +683,10 @@ async def upcomingmatches_cmd(ctx: discord.ApplicationContext):
         return await ctx.respond("❌ Could not fetch match data.")
 
     events = [
-        "VCT 2025: China Stage 2", "Esports World Cup 2025", "VCT 2025: Pacific Stage 2", "VCT 2025: EMEA Stage 2",
-        "VCT 2025: Americas Stage 2", "Valorant Champions 2025"
+        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
+        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
+        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
+        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
     ]
 
     segments = data["data"]["segments"]
@@ -700,7 +705,7 @@ async def upcomingmatches_cmd(ctx: discord.ApplicationContext):
     if output_lines:
         await ctx.respond("\n".join(output_lines))
     else:
-        await ctx.respond("❌ No upcoming matches found for 2025 VCT Tier 1 matches. (Game might be too far into the future)")
+        await ctx.respond("❌ No upcoming matches found for 2026 VCT Tier 1 matches. (Game might be too far into the future)")
     return None
 
 # COMMAND: !livescore
@@ -711,8 +716,10 @@ async def matches(ctx: discord.ApplicationContext):
         return await ctx.respond("❌ Could not fetch match data.")
 
     events = [
-        "VCT 2025: China Stage 2", "Esports World Cup 2025", "VCT 2025: Pacific Stage 2", "VCT 2025: EMEA Stage 2",
-        "VCT 2025: Americas Stage 2", "Valorant Champions 2025"
+        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
+        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
+        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
+        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
     ]
 
     segments = data["data"]["segments"]
@@ -798,8 +805,10 @@ async def gamble_command(
     segments = data["data"]["segments"]
     # Use the same event ordering as /upcomingmatches
     events = [
-        "VCT 2025: China Stage 2", "Esports World Cup 2025", "VCT 2025: Pacific Stage 2", "VCT 2025: EMEA Stage 2",
-        "VCT 2025: Americas Stage 2", "Valorant Champions 2025"
+        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
+        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
+        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
+        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
     ]
     match = None
     for event_name in events:
