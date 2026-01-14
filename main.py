@@ -26,7 +26,7 @@ base_vlresports_url = "https://vlr.orlandomm.net/api/v1/"
 
 keep_alive()
 # We treat all input times as America/Los_Angeles
-TZ = pytz.timezone("America/Los_Angeles")
+TZ = pytz.timezone("America/Phoenix")
 # End configuration
 
 intents = discord.Intents.default()
@@ -570,11 +570,11 @@ async def regionranks(ctx: discord.ApplicationContext,
     elif region_key == "eu":
         whitelist = { "FNATIC","BBL Esports","FUT Esports","Karmine Corp","Gentle Mates",
                       "Natus Vincere","Team Heretics","Team Liquid","Team Vitality","GIANTX",
-                      "ULF Esports", "PCIFIC Espor"}
+                      "ULF Esports", "PCIFIC Esports"}
     elif region_key in ("ap", "kr", "jp"):
         whitelist = { "DetonatioN FocusMe","DRX","Gen.G","Global Esports","Paper Rex",
-                      "Rex Regum Qeon","T1","TALON","Team Secret","ZETA DIVISION",
-                      "Nongshim RedForce","BOOM Esports" }
+                      "Rex Regum Qeon","T1","VARREL","Team Secret","ZETA DIVISION",
+                      "Nongshim RedForce","FULL SENSE" }
     else:
         return await ctx.respond(
             "❌ Please select a region!", ephemeral=True)
