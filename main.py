@@ -21,6 +21,7 @@ from typing import List, Dict, Tuple, Set
 # Configuration stuff
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
+ADMIN_USER_ID = os.getenv("ADMIN_USER")
 base_axsddlr_url = "https://vlrggapi.vercel.app/"
 base_vlresports_url = "https://vlr.orlandomm.net/api/v1/"
 
@@ -766,6 +767,22 @@ async def balance_command(ctx: discord.ApplicationContext):
     bal = get_balance(ctx.author.id)
     await ctx.respond(f"💰 <@{ctx.author.id}>, your current balance is **{bal}** points.")
 
+@bot.slash_command(name="setmoney", description="Admin command to edit a user's balance.")
+async def setmoney(
+    ctx: discord.ApplicationContext,
+    user: Option(discord.Member, "User to modify", required=True), # type: ignore
+    amount: Option(int, "New balance amount", required=True) # type: ignore
+):
+    # Only allow the specific Discord ID
+    if ctx.author.id != ADMIN_USER_ID:
+        await ctx.respond("❌ You are not allowed to use this command.", ephemeral=True)
+        return
+
+    update_balance(user.id, amount)
+
+    await ctx.respond(
+        f"💰 Balance for {user.mention} has been set to **{amount}** points."
+    )
 
 # COMMAND: /leaderboard
 @bot.slash_command(name="leaderboard", description="Show the top 5 richest users and your rank.")
@@ -787,7 +804,7 @@ async def leaderboard_command(ctx: discord.ApplicationContext):
 @bot.slash_command(name="gamble", description="Gamble on the next VCT match by choosing a team.")
 async def gamble_command(
     ctx: discord.ApplicationContext,
-    amount: Option(int, "The number of points you want to wager", required=True)  # type: ignore
+    amount: Option(int, "The number of points you want to wager (-1 for all-in)", required=True)  # type: ignore
 ):
     """
     Handle a gambling interaction where the user first confirms their intent,
@@ -795,42 +812,52 @@ async def gamble_command(
     the database and processed automatically when the match starts/finishes.
     """
     user_id = ctx.author.id
-    # Ensure the amount is positive
+
+    # Get current balance first
+    bal = get_balance(user_id)
+
+    # Special case: -1 means all-in
+    if amount == -1:
+        amount = bal
+
+    # Reject invalid amounts
     if amount <= 0:
-        return await ctx.respond("❌ The amount must be a positive integer.")
+        return await ctx.respond("❌ The amount must be a positive integer, or use **-1** to go all-in.")
+
+    # Prevent betting more than available
+    if amount > bal:
+        return await ctx.respond(
+            f"❌ You don't have enough points to wager **{amount}**. Your current balance is **{bal}**."
+        )
+
     # Fetch upcoming match data
     data = get_upcoming_match()
     if not data or "data" not in data or "segments" not in data["data"]:
         return await ctx.respond("❌ Could not fetch upcoming match data.")
+
     segments = data["data"]["segments"]
-    # Use the same event ordering as /upcomingmatches
+
     events = [
         "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
         "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
         "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
         "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
     ]
+
     match = None
     for event_name in events:
         match = next((seg for seg in segments if seg.get("match_event") == event_name), None)
         if match:
             break
+
     if not match:
         return await ctx.respond("❌ No upcoming VCT matches are currently available to bet on.")
-    # Extract match details
+
     match_event = match.get("match_event") or "Unknown Event"
     team1 = match.get("team1")
     team2 = match.get("team2")
     match_page = match.get("match_page")
-    # Normalize match_page for storage and comparisons
-    normalized_mp = _normalize_match_page(match_page)
-    # Check user's balance
-    bal = get_balance(user_id)
-    if amount > bal:
-        return await ctx.respond(
-            f"❌ You don't have enough points to wager **{amount}**. Your current balance is **{bal}**."
-        )
-    # First confirmation view
+
     class ConfirmGambleView(discord.ui.View):
         def __init__(self, author_id: int, amount: int):
             super().__init__(timeout=60)
@@ -839,18 +866,19 @@ async def gamble_command(
 
         @discord.ui.button(label="Yes", style=discord.ButtonStyle.green)
         async def confirm(self, button: discord.ui.Button, interaction: discord.Interaction):  # type: ignore
-            # Only the original user can confirm
             if interaction.user.id != self.author_id:
-                return await interaction.response.send_message("❌ You cannot respond to someone else's bet.",
-                                                             ephemeral=True)
-            # Double-check balance in case it changed since the command was invoked
+                return await interaction.response.send_message(
+                    "❌ You cannot respond to someone else's bet.",
+                    ephemeral=True
+                )
+
             current_bal = get_balance(self.author_id)
             if self.amount > current_bal:
                 return await interaction.response.edit_message(
                     content=f"❌ Your balance has changed and you no longer have enough points to wager {self.amount}.",
                     view=None
                 )
-            # Present team selection view
+
             class TeamSelectView(discord.ui.View):
                 def __init__(self, author_id: int, amount: int):
                     super().__init__(timeout=60)
@@ -864,15 +892,17 @@ async def gamble_command(
                             "❌ You cannot choose a team for someone else's bet.",
                             ephemeral=True
                         )
-                    # Deduct wager and store bet
+
                     bal_now = get_balance(self.author_id)
                     if self.amount > bal_now:
                         return await inter.response.edit_message(
                             content=f"❌ Your balance has changed and you no longer have enough points to wager {self.amount}.",
                             view=None
                         )
+
                     update_balance(self.author_id, bal_now - self.amount)
                     store_bet(match_page, match_event, team1, team2, self.author_id, team1, self.amount, ctx.channel.id)
+
                     await inter.response.edit_message(
                         content=(
                             f"✅ Bet placed! You wagered **{self.amount}** points on **{team1}** to win the next "
@@ -889,14 +919,17 @@ async def gamble_command(
                             "❌ You cannot choose a team for someone else's bet.",
                             ephemeral=True
                         )
+
                     bal_now = get_balance(self.author_id)
                     if self.amount > bal_now:
                         return await inter.response.edit_message(
                             content=f"❌ Your balance has changed and you no longer have enough points to wager {self.amount}.",
                             view=None
                         )
+
                     update_balance(self.author_id, bal_now - self.amount)
                     store_bet(match_page, match_event, team1, team2, self.author_id, team2, self.amount, ctx.channel.id)
+
                     await inter.response.edit_message(
                         content=(
                             f"✅ Bet placed! You wagered **{self.amount}** points on **{team2}** to win the next "
@@ -921,9 +954,7 @@ async def gamble_command(
 
             team_view = TeamSelectView(self.author_id, self.amount)
             await interaction.response.edit_message(
-                content=(
-                    f"Select the team you think will win the upcoming match (Event: {match_event})."
-                ),
+                content=f"Select the team you think will win the upcoming match (Event: {match_event}).",
                 view=team_view
             )
             self.stop()
