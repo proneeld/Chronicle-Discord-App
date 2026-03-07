@@ -21,7 +21,8 @@ from typing import List, Dict, Tuple, Set
 # Configuration stuff
 load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
-ADMIN_USER_ID = os.getenv("ADMIN_USER")
+admin_id_raw = os.getenv("ADMIN_USER")
+ADMIN_USER_ID = int(admin_id_raw) if admin_id_raw else 0
 base_axsddlr_url = "https://vlrggapi.vercel.app/"
 base_vlresports_url = "https://vlr.orlandomm.net/api/v1/"
 
