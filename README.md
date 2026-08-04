@@ -11,4 +11,5 @@ NOTE: THIS IS FOR THE 2025 SEASON ONLY. 2026 SEASON WILL BE UPDATED SHORTLY BEFO
 # Videos and Screenshots
 
 # UPDATES
-* 12/04/2025: Code is now uploaded. I have also contacted Liquipedia to be able to use their free version of their API, which is exponentially better than my current API. We shall see if they respond
+* 12/04/2025: Code is now uploaded. I have also contacted Liquipedia to be able to use their free version of their API, which is exponentially better than my current API. We shall see if they respond (UPDATE: liquipedia hates me and they suck)
+* 08/04/2026: Optimized a bit and also updated API to V2
