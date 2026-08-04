@@ -1,33 +1,41 @@
 import sys
 import asyncio
-import requests  # type: ignore
+import os
 import sqlite3
-import random
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+
+import requests  # type: ignore
 if sys.platform == "win32":
     # Use the SelectorEventLoop instead of the ProactorEventLoop on Windows
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from dotenv import load_dotenv # type: ignore
-import os
-import discord # type: ignore
-from discord.commands import Option # type: ignore
-from discord.ext import commands, tasks # type: ignore
-from datetime import datetime, timedelta
-import pytz  # type: ignore # pip install pytz
+from dotenv import load_dotenv  # type: ignore
+import discord  # type: ignore
+from discord.commands import Option  # type: ignore
+from discord.ext import commands, tasks  # type: ignore
+import pytz  # type: ignore  # pip install pytz
 from keep_alive import keep_alive
-from typing import List, Dict, Tuple, Set
 
-# Configuration stuff
+# Configuration
 load_dotenv()
-token = os.getenv("DISCORD_TOKEN")
-admin_id_raw = os.getenv("ADMIN_USER")
-ADMIN_USER_ID = int(admin_id_raw) if admin_id_raw else 0
-base_axsddlr_url = "https://vlrggapi.vercel.app/"
-base_vlresports_url = "https://vlr.orlandomm.net/api/v1/"
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+_admin_user = os.getenv("ADMIN_USER")
+try:
+    ADMIN_USER_ID: Optional[int] = int(_admin_user) if _admin_user else None
+except ValueError:
+    ADMIN_USER_ID = None
+    print("Warning: ADMIN_USER must be a numeric Discord user ID.")
+
+# The API README recommends V2. Set VLR_API_BASE_URL to your self-hosted
+# root (for example, http://127.0.0.1:3001) or directly to a /v2 URL.
+_api_root = os.getenv("VLR_API_BASE_URL", "https://vlrggapi.vercel.app").rstrip("/")
+VLR_API_BASE_URL = _api_root if _api_root.endswith("/v2") else f"{_api_root}/v2"
+VLR_API_TIMEOUT_SECONDS = 15
 
 keep_alive()
-# We treat all input times as America/Los_Angeles
 TZ = pytz.timezone("America/Phoenix")
 # End configuration
 
@@ -42,7 +50,7 @@ bot = discord.Bot(intents=intents)
 # Global Database (only one meeting at a time)
 # Only schedule one meeting, scheduling another one overwrites
 meeting = {
-    "scheduled_time": None,        # datetime (PST) when we check the voice channel
+    "scheduled_time": None,        # datetime (America/Phoenix) when we check the voice channel
     "voice_channel_id": None,      # int ID of the voice channel
     "participants": set(),         # set of user IDs (ints)
     "lateness_counts": {},         # dict { user_id: int, … } accumulated across meetings
@@ -108,24 +116,21 @@ def init_db() -> None:
     conn.close()
 
 
-def _maybe_apply_daily_bonus(row: sqlite3.Row) -> int:
+def _maybe_apply_daily_bonus(conn: sqlite3.Connection, row: sqlite3.Row) -> int:
     """
-    Apply a daily bonus to the user's balance if their balance is below
-    DAILY_BONUS_THRESHOLD and at least DAILY_BONUS_INTERVAL seconds have
-    passed since their last bonus. Returns the possibly updated balance.
+    Apply a daily bonus using the caller's existing transaction. Reusing the
+    same connection avoids an unnecessary nested SQLite connection and reduces
+    the chance of database-lock errors.
     """
-    current_time = int(datetime.utcnow().timestamp())
+    current_time = int(datetime.now().timestamp())
     balance = row["balance"]
     last_bonus = row["last_daily_bonus"] or 0
     if balance < DAILY_BONUS_THRESHOLD and (current_time - last_bonus) >= DAILY_BONUS_INTERVAL:
         balance += DAILY_BONUS_AMOUNT
-        conn = sqlite3.connect(DATABASE_FILE)
-        with conn:
-            conn.execute(
-                "UPDATE balances SET balance = ?, last_daily_bonus = ? WHERE user_id = ?",
-                (balance, current_time, row["user_id"]),
-            )
-        conn.close()
+        conn.execute(
+            "UPDATE balances SET balance = ?, last_daily_bonus = ? WHERE user_id = ?",
+            (balance, current_time, row["user_id"]),
+        )
     return balance
 
 
@@ -147,7 +152,7 @@ def get_balance(user_id: int) -> int:
             )
             balance = STARTING_BALANCE
         else:
-            balance = _maybe_apply_daily_bonus(row)
+            balance = _maybe_apply_daily_bonus(conn, row)
     conn.close()
     return balance
 
@@ -214,17 +219,61 @@ def _normalize_match_page(match_page: str) -> str:
     return match_page
 
 
-def store_bet(match_page: str, match_event: str, team1: str, team2: str, user_id: int, team_bet: str, amount: int, channel_id: int) -> None:
-    """Persist a new bet for a given match."""
+def place_bet(
+    match_page: str,
+    match_event: str,
+    team1: str,
+    team2: str,
+    user_id: int,
+    team_bet: str,
+    amount: int,
+    channel_id: int,
+) -> bool:
+    """Atomically verify funds, deduct the wager, and persist the bet."""
     mp = _normalize_match_page(match_page)
-    conn = sqlite3.connect(DATABASE_FILE)
-    with conn:
+    conn = sqlite3.connect(DATABASE_FILE, timeout=10)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM balances WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+        if row is None:
+            balance = STARTING_BALANCE
+            conn.execute(
+                "INSERT INTO balances (user_id, balance, last_daily_bonus) VALUES (?, ?, 0)",
+                (user_id, balance),
+            )
+        else:
+            balance = _maybe_apply_daily_bonus(conn, row)
+
+        if amount <= 0 or amount > balance:
+            conn.commit()
+            return False
+
         conn.execute(
-            "INSERT INTO bets (match_page, match_event, team1, team2, user_id, team_bet, amount, channel_id, start_notified, resolved) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)",
+            "UPDATE balances SET balance = balance - ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO bets (
+                match_page, match_event, team1, team2, user_id, team_bet,
+                amount, channel_id, start_notified, resolved
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+            """,
             (mp, match_event, team1, team2, user_id, team_bet, amount, channel_id),
         )
-    conn.close()
+        conn.commit()
+        return True
+    except sqlite3.Error as exc:
+        conn.rollback()
+        print(f"Could not place bet: {exc}")
+        return False
+    finally:
+        conn.close()
 
 
 def get_open_bets() -> List[Dict]:
@@ -257,35 +306,37 @@ def mark_start_notified(match_page: str) -> None:
 
 def resolve_bets(match_page: str, winning_team: str) -> Tuple[List[Dict], List[Dict]]:
     """
-    Resolve all outstanding bets for a given match. Winners receive double
-    their wager (they already paid the wager when placing the bet). Losers
-    receive nothing. Returns two lists: winners and losers, each entry being
-    the bet row dict.
+    Resolve all outstanding bets in one SQLite transaction. Winners receive
+    double their wager because the original wager was deducted when placed.
     """
     mp = _normalize_match_page(match_page)
     conn = sqlite3.connect(DATABASE_FILE)
     conn.row_factory = sqlite3.Row
-    winners = []
-    losers = []
+    winners: List[Dict] = []
+    losers: List[Dict] = []
     with conn:
-        cur = conn.execute(
+        bet_rows = conn.execute(
             "SELECT * FROM bets WHERE match_page = ? AND resolved = 0",
             (mp,),
-        )
-        bet_rows = cur.fetchall()
+        ).fetchall()
+
         for row in bet_rows:
             bet = dict(row)
             if bet["team_bet"] == winning_team:
-                # winner
                 winners.append(bet)
-                # pay double the amount (because original amount already deducted)
-                user_id = bet["user_id"]
-                amount = bet["amount"]
-                current_balance = get_balance(user_id)
-                update_balance(user_id, current_balance + amount * 2)
+                payout = bet["amount"] * 2
+                conn.execute(
+                    """
+                    INSERT INTO balances (user_id, balance, last_daily_bonus)
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(user_id) DO UPDATE
+                    SET balance = balances.balance + excluded.balance
+                    """,
+                    (bet["user_id"], payout),
+                )
             else:
                 losers.append(bet)
-        # Mark all bets for this match as resolved
+
         conn.execute(
             "UPDATE bets SET resolved = 1 WHERE match_page = ? AND resolved = 0",
             (mp,),
@@ -298,11 +349,13 @@ def resolve_bets(match_page: str, winning_team: str) -> Tuple[List[Dict], List[D
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print("------")
-    # Start the background loop that watches for when to send reminders / check attendance
-    meeting_watcher.start()
-    # Make the database and start the bet watcher when the bot is ready
     init_db()
-    bet_watcher.start()
+
+    # on_ready can run again after Discord reconnects, so only start each loop once.
+    if not meeting_watcher.is_running():
+        meeting_watcher.start()
+    if not bet_watcher.is_running():
+        bet_watcher.start()
 
 
 @tasks.loop(seconds=30)
@@ -402,7 +455,7 @@ async def list_commands(ctx):
                       f"- **/upcomingmatches**: Gets upcoming matches for each event\n"
                       f"- **/livescore**: Gets live score for ongoing games")
 # COMMAND: !schedule
-@bot.slash_command(name="schedule", description="Schedule a voice-channel meeting. Time zone is in PST")
+@bot.slash_command(name="schedule", description="Schedule a voice-channel meeting in Arizona time (MST)")
 async def schedule(
     ctx: discord.ApplicationContext,
     date: Option(str, "Date in YYYY-MM-DD", required=True), # type: ignore
@@ -416,21 +469,21 @@ async def schedule(
     """
     Schedule a meeting.
       date_str: "YYYY-MM-DD"
-      time_str: "HH:MM" (24-hour, in PST)
+      time_str: "HH:MM" (24-hour, in Arizona time)
       voice_channel: a voice-channel mention (e.g. #General-Voice)
       mentions: list of @users who must join
     """
-    # 1) Parse date & time (in PST)
+    # 1) Parse date and time in America/Phoenix
     try:
         naive = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
         dt_pst = TZ.localize(naive)
     except ValueError:
-        await ctx.send("❌ Incorrect date and time format. Please use `YYYY-MM-DD HH:MM` in 24h PST.")
+        await ctx.send("❌ Incorrect date and time format. Please use `YYYY-MM-DD HH:MM` in 24-hour Arizona time.")
         return
 
     now_pst = datetime.now(tz=TZ)
     if dt_pst <= now_pst:
-        await ctx.send("❌ You must choose a future date/time (PST).")
+        await ctx.send("❌ You must choose a future date/time in Arizona time.")
         return
 
     members = [m for m in [participant1, participant2, participant3, participant4, participant5] if m]
@@ -447,7 +500,7 @@ async def schedule(
     # Keep any existing lateness_counts so they accumulate across meetings
     meeting["text_channel_id"] = ctx.channel.id
 
-    human_time = dt_pst.strftime("%Y-%m-%d %H:%M PST")
+    human_time = dt_pst.strftime("%Y-%m-%d %H:%M MST")
     human_list = " ".join(m.mention for m in members)
 
     await ctx.respond(
@@ -482,7 +535,7 @@ async def list_meeting(ctx: discord.ApplicationContext):
         return
 
     # Otherwise, it’s still a future meeting. Show its details:
-    human_time = scheduled.strftime("%Y-%m-%d %H:%M PST")
+    human_time = scheduled.strftime("%Y-%m-%d %H:%M MST")
 
     # Find the voice-channel name
     voice_chan = None
@@ -535,225 +588,300 @@ async def reset_lateness(ctx: discord.ApplicationContext):
     await ctx.respond("✅ All lateness counts have been reset to zero.")
 
 
-# HELPER
-def get_regionranks_info(region: str):
-    url = f"{base_axsddlr_url}rankings?region={region}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
+# VCT event names are kept in one place so match commands and betting stay in sync.
+VCT_TIER_1_EVENTS = (
+    "VCT 2026: Americas Kickoff",
+    "VCT 2026: EMEA Kickoff",
+    "VCT 2026: Pacific Kickoff",
+    "VCT 2026: China Kickoff",
+    "Valorant Masters Santiago 2026",
+    "VCT 2026: Pacific Stage 1",
+    "VCT 2026: Americas Stage 1",
+    "VCT 2026: EMEA Stage 1",
+    "VCT 2026: China Stage 1",
+    "Valorant Masters London 2026",
+    "VCT 2026: Pacific Stage 2",
+    "VCT 2026: Americas Stage 2",
+    "VCT 2026: EMEA Stage 2",
+    "VCT 2026: China Stage 2",
+    "Valorant Champions 2026",
+)
 
-def get_matches_info(idk: str):
-    url = f"{base_axsddlr_url}match?q={idk}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
 
-# COMMAND: /regionranks 
-@bot.slash_command(name="regionranks", description="Filters to show only the major teams in each region, sorted by rank.")
-async def regionranks(ctx: discord.ApplicationContext,
-                      region: Option(str, "Region code", required=True, choices=[
-                          "na", "la", "la-s", "la-n", "cn", "eu", "ap", "kr", "jp"])): # type: ignore
-    if not region:
-        return await ctx.send(
-            "❌ Please pick one of the following:\n`na (North America)`\n`la (LATAM)`\n`la-s (More LATAM)`\n`la-n (Even MORE LATAM)`\n`cn (China)`\n`eu (EMEA)`\n`ap (APAC)`\n`kr (Korea (also part of APAC))`\n`jp (Japan (also part of APAC))`"
-        )
+def _request_vlr_api_sync(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Perform one V2 API request with a timeout and useful error logging."""
+    url = f"{VLR_API_BASE_URL}/{endpoint.lstrip('/')}"
+    try:
+        response = requests.get(url, params=params, timeout=VLR_API_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        print(f"VLR API request failed for {url}: {exc}")
+        return None
+    except ValueError as exc:
+        print(f"VLR API returned invalid JSON for {url}: {exc}")
+        return None
 
-    region_key = region.lower()
-    # 1) Define your whitelists (unchanged) …
-    if region_key in ("na", "la", "la-s", "la-n"):
-        whitelist = { "100 Thieves","Cloud9","Evil Geniuses","FURIA","KRÜ Esports",
-                      "Leviatán","LOUD","MIBR","NRG","Sentinels","G2 Esports","ENVY"}
-    elif region_key == "cn":
-        whitelist = { "All Gamers","Bilibili Gaming","EDward Gaming","FunPlus Phoenix",
-                      "JDG Esports","Nova Esports","Titan Esports Club","Trace Esports",
-                      "TYLOO","Wolves Esports","Dragon Ranger Gaming","Xi Lai Gaming" }
-    elif region_key == "eu":
-        whitelist = { "FNATIC","BBL Esports","FUT Esports","Karmine Corp","Gentle Mates",
-                      "Natus Vincere","Team Heretics","Team Liquid","Team Vitality","GIANTX",
-                      "ULF Esports", "PCIFIC Esports"}
-    elif region_key in ("ap", "kr", "jp"):
-        whitelist = { "DetonatioN FocusMe","DRX","Gen.G","Global Esports","Paper Rex",
-                      "Rex Regum Qeon","T1","VARREL","Team Secret","ZETA DIVISION",
-                      "Nongshim RedForce","FULL SENSE" }
-    else:
-        return await ctx.respond(
-            "❌ Please select a region!", ephemeral=True)
+    if not isinstance(payload, dict) or payload.get("status") != "success":
+        print(f"VLR API returned an unexpected V2 response for {url}: {payload}")
+        return None
+    return payload
 
-    # 2) Fetch the API data
-    data = get_regionranks_info(region_key)
-    if not data or "data" not in data:
-        return await ctx.respond("❌ Could not fetch ranking data.")
 
-    # 3) Filter to only whitelisted teams **and** sort by their rank as an integer
-    filtered = [
-        t for t in data["data"]
-        if t["team"] in whitelist
+async def _request_vlr_api(endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Run blocking requests work off the Discord event loop."""
+    return await asyncio.to_thread(_request_vlr_api_sync, endpoint, params)
+
+
+def _extract_segments(payload: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract the standardized V2 data.segments list safely."""
+    if not payload:
+        return []
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    segments = data.get("segments")
+    if not isinstance(segments, list):
+        return []
+    return [segment for segment in segments if isinstance(segment, dict)]
+
+
+async def get_regionranks_info(region: str) -> Optional[Dict[str, Any]]:
+    return await _request_vlr_api("rankings", {"region": region})
+
+
+async def get_matches_info(query: str) -> Optional[Dict[str, Any]]:
+    return await _request_vlr_api("match", {"q": query})
+
+
+async def get_recent_match() -> Optional[Dict[str, Any]]:
+    return await get_matches_info("results")
+
+
+async def get_upcoming_match() -> Optional[Dict[str, Any]]:
+    return await get_matches_info("upcoming")
+
+
+async def get_live_score() -> Optional[Dict[str, Any]]:
+    return await get_matches_info("live_score")
+
+
+def _round_val(value: Any) -> int:
+    if value in (None, "", "N/A"):
+        return 0
+    return _safe_int(value)
+
+
+def _vlr_match_url(match_page: Any) -> str:
+    if not isinstance(match_page, str) or not match_page:
+        return "https://www.vlr.gg"
+    if match_page.startswith(("http://", "https://")):
+        return match_page
+    return f"https://www.vlr.gg/{match_page.lstrip('/')}"
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_event_name(name: Any) -> str:
+    if not isinstance(name, str):
+        return ""
+    normalized = " ".join(name.strip().casefold().split())
+    if normalized.startswith("valorant champions tour "):
+        normalized = "vct " + normalized.removeprefix("valorant champions tour ")
+    elif normalized.startswith("champions tour "):
+        normalized = "vct " + normalized.removeprefix("champions tour ")
+    return normalized
+
+
+VCT_TIER_1_EVENT_KEYS = {_normalize_event_name(name) for name in VCT_TIER_1_EVENTS}
+
+
+def _ordered_tier_one_matches(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return at most one match per configured event in display order."""
+    first_by_event: Dict[str, Dict[str, Any]] = {}
+    for segment in segments:
+        event_name = segment.get("match_event") or segment.get("tournament_name")
+        key = _normalize_event_name(event_name)
+        if key in VCT_TIER_1_EVENT_KEYS and key not in first_by_event:
+            first_by_event[key] = segment
+
+    return [
+        first_by_event[key]
+        for event_name in VCT_TIER_1_EVENTS
+        if (key := _normalize_event_name(event_name)) in first_by_event
     ]
-    filtered.sort(key=lambda t: int(t["rank"]))
+
+
+def _chunk_blocks(blocks: List[str], limit: int = 1900) -> List[str]:
+    """Group formatted blocks without exceeding Discord's message limit."""
+    chunks: List[str] = []
+    current = ""
+    for block in blocks:
+        block = block.strip()
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+        if len(block) <= limit:
+            current = block
+        else:
+            chunks.extend(block[i:i + limit] for i in range(0, len(block), limit))
+            current = ""
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+async def _respond_with_blocks(ctx: discord.ApplicationContext, blocks: List[str]) -> None:
+    chunks = _chunk_blocks(blocks)
+    if not chunks:
+        return
+    await ctx.respond(chunks[0])
+    for chunk in chunks[1:]:
+        await ctx.send(chunk)
+
+
+# COMMAND: /regionranks
+@bot.slash_command(name="regionranks", description="Filters to show only the major teams in each region, sorted by rank.")
+async def regionranks(
+    ctx: discord.ApplicationContext,
+    region: Option(str, "Region code", required=True, choices=[
+        "na", "la", "la-s", "la-n", "cn", "eu", "ap", "kr", "jp"
+    ]),  # type: ignore
+):
+    region_key = region.lower()
+    if region_key in ("na", "la", "la-s", "la-n"):
+        whitelist = {
+            "100 Thieves", "Cloud9", "Evil Geniuses", "FURIA", "KRÜ Esports",
+            "Leviatán", "LOUD", "MIBR", "NRG", "Sentinels", "G2 Esports", "ENVY",
+        }
+    elif region_key == "cn":
+        whitelist = {
+            "All Gamers", "Bilibili Gaming", "EDward Gaming", "FunPlus Phoenix",
+            "JDG Esports", "Nova Esports", "Titan Esports Club", "Trace Esports",
+            "TYLOO", "Wolves Esports", "Dragon Ranger Gaming", "Xi Lai Gaming",
+        }
+    elif region_key == "eu":
+        whitelist = {
+            "FNATIC", "BBL Esports", "FUT Esports", "Karmine Corp", "Gentle Mates",
+            "Natus Vincere", "Team Heretics", "Team Liquid", "Team Vitality", "GIANTX",
+            "ULF Esports", "PCIFIC Esports",
+        }
+    elif region_key in ("ap", "kr", "jp"):
+        whitelist = {
+            "DetonatioN FocusMe", "DRX", "Gen.G", "Global Esports", "Paper Rex",
+            "Rex Regum Qeon", "T1", "VARREL", "Team Secret", "ZETA DIVISION",
+            "Nongshim RedForce", "FULL SENSE",
+        }
+    else:
+        return await ctx.respond("❌ Please select a valid region.", ephemeral=True)
+
+    payload = await get_regionranks_info(region_key)
+    if payload is None:
+        return await ctx.respond("❌ Could not fetch ranking data from the V2 API.")
+    segments = _extract_segments(payload)
+    if not segments:
+        return await ctx.respond("❌ The V2 API returned no ranking data for that region.")
+
+    filtered = [team for team in segments if team.get("team") in whitelist]
+    filtered.sort(key=lambda team: _safe_int(team.get("rank"), 999999))
 
     if not filtered:
-        return await ctx.respond("❌ None of the requested teams were found in the data.")
+        return await ctx.respond("❌ None of the requested teams were found in the ranking data.")
 
-    # 4) Format the sorted list
-    lines = []
-    for t in filtered:
-        lines.append(
-            f"**Rank {t['rank']} – {t['team']}**\n"
-            f"Last played: {t['last_played_team']}\n"
-            f"Earnings: {t['earnings']}\n"
+    blocks = []
+    for team in filtered:
+        last_played = team.get("last_played_team") or team.get("last_played") or "Unknown"
+        blocks.append(
+            f"**Rank {team.get('rank', '?')} – {team.get('team', 'Unknown team')}**\n"
+            f"Last played: {last_played}\n"
+            f"Record: {team.get('record', 'N/A')}\n"
+            f"Earnings: {team.get('earnings', 'N/A')}"
         )
+    await _respond_with_blocks(ctx, blocks)
 
-    await ctx.respond("\n".join(lines))
-    return None
-
-# HELPERS
-def get_recent_match():
-    url = f"{base_axsddlr_url}match?q=results"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
-
-def get_upcoming_match():
-    url = f"{base_axsddlr_url}match?q=upcoming"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
-
-def get_live_score():
-    url = f"{base_axsddlr_url}match?q=live_score"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
-
-def _round_val(v: str) -> int:
-    if not v or v == "N/A":
-        return 0
-    try:
-        return int(v)
-    except ValueError:
-        return 0
 
 # COMMAND: /recentmatches
 @bot.slash_command(name="recentmatches", description="Gets the results of the recent matches.")
 async def recentmatch_cmd(ctx: discord.ApplicationContext):
+    payload = await get_recent_match()
+    if payload is None:
+        return await ctx.respond("❌ Could not fetch match data from the V2 API.")
+    segments = _extract_segments(payload)
+    matches = _ordered_tier_one_matches(segments)
+    if not matches:
+        return await ctx.respond("❌ No recent results found for 2026 VCT Tier 1 matches.")
 
-    data = get_recent_match()
-    if not data or "data" not in data or "segments" not in data["data"]:
-        return await ctx.respond("❌ Could not fetch match data.")
-
-    events = [
-        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
-        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
-        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
-        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
+    blocks = [
+        f"**{match.get('tournament_name', 'Unknown event')}**\n"
+        f"**{match.get('round_info', 'Unknown round')}**\n"
+        f"**{match.get('team1', 'TBD')} vs. {match.get('team2', 'TBD')}**\n"
+        f"**Final Score:** {match.get('score1', '?')} - {match.get('score2', '?')}\n"
+        f"Game happened {match.get('time_completed', 'recently')}\n"
+        f"vlr.gg link: {_vlr_match_url(match.get('match_page'))}"
+        for match in matches
     ]
-
-    segments = data["data"]["segments"]
-    output_lines = []
-
-    for event_name in events:
-        match = next(
-            (seg for seg in segments if seg.get("tournament_name") == event_name),
-            None
-        )
-        if match:
-            output_lines.append(
-                f"**{match['tournament_name']}**\n"
-                f"**{match['round_info']}**\n"
-                f"**{match['team1']} vs. {match['team2']}**\n"
-                f"**Final Score: ** {match['score1']} - {match['score2']}\n"
-                f"Game happened {match['time_completed']}\n"
-                f"vlr.gg link: https://www.vlr.gg{match['match_page']}"
-            )
-    if output_lines:
-        await ctx.respond("\n".join(output_lines))
-    else:
-        await ctx.respond("❌ No recent results found for 2026 VCT Tier 1 matches.")
-    return None
+    await _respond_with_blocks(ctx, blocks)
 
 
 # COMMAND: /upcomingmatches
 @bot.slash_command(name="upcomingmatches", description="Gets upcoming VCT Tier 1 matches from all regions")
 async def upcomingmatches_cmd(ctx: discord.ApplicationContext):
-    data = get_upcoming_match()
-    if not data or "data" not in data or "segments" not in data["data"]:
-        return await ctx.respond("❌ Could not fetch match data.")
+    payload = await get_upcoming_match()
+    if payload is None:
+        return await ctx.respond("❌ Could not fetch match data from the V2 API.")
+    segments = _extract_segments(payload)
+    matches = _ordered_tier_one_matches(segments)
+    if not matches:
+        return await ctx.respond(
+            "❌ No upcoming matches found for 2026 VCT Tier 1 events. The games may be too far in the future."
+        )
 
-    events = [
-        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
-        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
-        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
-        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
+    blocks = [
+        f"**Upcoming game for {match.get('match_event', 'Unknown event')}**\n"
+        f"**{match.get('match_series', 'Unknown series')}**\n"
+        f"**{match.get('team1', 'TBD')} vs. {match.get('team2', 'TBD')}**\n"
+        f"Game is **{match.get('time_until_match', 'TBD')}**\n"
+        f"vlr.gg link: {_vlr_match_url(match.get('match_page'))}"
+        for match in matches
     ]
+    await _respond_with_blocks(ctx, blocks)
 
-    segments = data["data"]["segments"]
-    output_lines = []
 
-    for event_name in events:
-        match = next((seg for seg in segments if seg.get("match_event") == event_name), None)
-        if match:
-            output_lines.append(
-                f"**Upcoming game for **{match['match_event']}\n"
-                f"**{match['match_series']}**\n"
-                f"**{match['team1']} vs. {match['team2']}**\n"
-                f"Game is **{match['time_until_match']}**\n"
-                f"vlr.gg link: {match['match_page']}\n"
-            )
-    if output_lines:
-        await ctx.respond("\n".join(output_lines))
-    else:
-        await ctx.respond("❌ No upcoming matches found for 2026 VCT Tier 1 matches. (Game might be too far into the future)")
-    return None
-
-# COMMAND: !livescore
+# COMMAND: /livescore
 @bot.slash_command(name="livescore", description="Gets live score for VCT Tier 1 matches")
 async def matches(ctx: discord.ApplicationContext):
-    data = get_live_score()
-    if not data or "data" not in data or "segments" not in data["data"]:
-        return await ctx.respond("❌ Could not fetch match data.")
+    payload = await get_live_score()
+    if payload is None:
+        return await ctx.respond("❌ Could not fetch live match data from the V2 API.")
+    segments = _extract_segments(payload)
+    live_matches = _ordered_tier_one_matches(segments)
+    if not live_matches:
+        return await ctx.respond("❌ No ongoing matches. Use /upcomingmatches to see the next one.")
 
-    events = [
-        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
-        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
-        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
-        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
-    ]
-
-    segments = data["data"]["segments"]
-    output_lines = []
-
-    for event_name in events:
-        match = next((seg for seg in segments if seg.get("match_event") == event_name), None)
-        if not match:
-            continue
-
-        r1_ct = _round_val(match.get("team1_round_ct"))
-        r1_t = _round_val(match.get("team1_round_t"))
-        r2_ct = _round_val(match.get("team2_round_ct"))
-        r2_t = _round_val(match.get("team2_round_t"))
-
-        team1_map_total = r1_ct + r1_t
-        team2_map_total = r2_ct + r2_t
-
-        series_score = f"**{match['team1']}** {match['score1']} - {match['score2']} **{match['team2']}**"
-
-        output_lines.append(
-            f"**{match['match_event']}** • **{match['match_series']}**\n"
-            f"**Series:**\n {series_score}\n"
-            f"**Current Map:**\n {match['current_map']}\n"
-            f"**Current Score:**\n **{match['team1']}** {team1_map_total} - {team2_map_total} **{match['team2']}**\n"
-            f"vlr.gg link: {match['match_page']}\n"
+    blocks = []
+    for match in live_matches:
+        team1_map_total = _round_val(match.get("team1_round_ct")) + _round_val(match.get("team1_round_t"))
+        team2_map_total = _round_val(match.get("team2_round_ct")) + _round_val(match.get("team2_round_t"))
+        team1 = match.get("team1", "Team 1")
+        team2 = match.get("team2", "Team 2")
+        blocks.append(
+            f"**{match.get('match_event', 'Unknown event')}** • **{match.get('match_series', 'Unknown series')}**\n"
+            f"**Series:** {team1} {match.get('score1', '?')} - {match.get('score2', '?')} {team2}\n"
+            f"**Current Map:** {match.get('current_map', 'Unknown')}\n"
+            f"**Current Score:** {team1} {team1_map_total} - {team2_map_total} {team2}\n"
+            f"vlr.gg link: {_vlr_match_url(match.get('match_page'))}"
         )
-    if output_lines:
-        await ctx.respond("\n".join(output_lines))
-    else:
-        await ctx.respond("❌ No ongoing matches. Use /upcomingmatches to see the next one")
-    return None
+    await _respond_with_blocks(ctx, blocks)
 
 
 # COMMAND: /valgamble
@@ -768,6 +896,7 @@ async def balance_command(ctx: discord.ApplicationContext):
     bal = get_balance(ctx.author.id)
     await ctx.respond(f"💰 <@{ctx.author.id}>, your current balance is **{bal}** points.")
 
+# COMMAND: /setmoney
 @bot.slash_command(name="setmoney", description="Admin command to edit a user's balance.")
 async def setmoney(
     ctx: discord.ApplicationContext,
@@ -831,33 +960,22 @@ async def gamble_command(
             f"❌ You don't have enough points to wager **{amount}**. Your current balance is **{bal}**."
         )
 
-    # Fetch upcoming match data
-    data = get_upcoming_match()
-    if not data or "data" not in data or "segments" not in data["data"]:
-        return await ctx.respond("❌ Could not fetch upcoming match data.")
-
-    segments = data["data"]["segments"]
-
-    events = [
-        "VCT 2026: Americas Kickoff", " VCT 2026: EMEA Kickoff", "VCT 2026: Pacific Kickoff", "VCT 2026: China Kickoff",
-        "Valorant Masters Santiago 2026", "VCT 2026: Pacific Stage 1", "VCT 2026: Americas Stage 1", "VCT 2026: EMEA Stage 1",
-        "VCT 2026: China Stage 1", "Valorant Masters London 2026", "VCT 2026: Pacific Stage 2", "VCT 2026: Americas Stage 2",
-        "VCT 2026: EMEA Stage 2", "VCT 2026: China Stage 2", "Valorant Champions 2026"
-    ]
-
-    match = None
-    for event_name in events:
-        match = next((seg for seg in segments if seg.get("match_event") == event_name), None)
-        if match:
-            break
-
-    if not match:
+    # Fetch upcoming match data without blocking Discord's event loop.
+    payload = await get_upcoming_match()
+    if payload is None:
+        return await ctx.respond("❌ Could not fetch upcoming match data from the V2 API.")
+    segments = _extract_segments(payload)
+    matches = _ordered_tier_one_matches(segments)
+    if not matches:
         return await ctx.respond("❌ No upcoming VCT matches are currently available to bet on.")
 
-    match_event = match.get("match_event") or "Unknown Event"
-    team1 = match.get("team1")
-    team2 = match.get("team2")
-    match_page = match.get("match_page")
+    match = matches[0]
+    match_event = str(match.get("match_event") or "Unknown Event")
+    team1 = str(match.get("team1") or "TBD")
+    team2 = str(match.get("team2") or "TBD")
+    match_page = str(match.get("match_page") or "")
+    if team1 == "TBD" or team2 == "TBD" or not match_page:
+        return await ctx.respond("❌ The upcoming match data is incomplete. Please try again later.")
 
     class ConfirmGambleView(discord.ui.View):
         def __init__(self, author_id: int, amount: int):
@@ -894,15 +1012,17 @@ async def gamble_command(
                             ephemeral=True
                         )
 
-                    bal_now = get_balance(self.author_id)
-                    if self.amount > bal_now:
+                    if not place_bet(
+                        match_page, match_event, team1, team2,
+                        self.author_id, team1, self.amount, ctx.channel.id,
+                    ):
                         return await inter.response.edit_message(
-                            content=f"❌ Your balance has changed and you no longer have enough points to wager {self.amount}.",
-                            view=None
+                            content=(
+                                f"❌ Your balance changed or the bet could not be saved. "
+                                f"You need at least {self.amount} points."
+                            ),
+                            view=None,
                         )
-
-                    update_balance(self.author_id, bal_now - self.amount)
-                    store_bet(match_page, match_event, team1, team2, self.author_id, team1, self.amount, ctx.channel.id)
 
                     await inter.response.edit_message(
                         content=(
@@ -921,15 +1041,17 @@ async def gamble_command(
                             ephemeral=True
                         )
 
-                    bal_now = get_balance(self.author_id)
-                    if self.amount > bal_now:
+                    if not place_bet(
+                        match_page, match_event, team1, team2,
+                        self.author_id, team2, self.amount, ctx.channel.id,
+                    ):
                         return await inter.response.edit_message(
-                            content=f"❌ Your balance has changed and you no longer have enough points to wager {self.amount}.",
-                            view=None
+                            content=(
+                                f"❌ Your balance changed or the bet could not be saved. "
+                                f"You need at least {self.amount} points."
+                            ),
+                            view=None,
                         )
-
-                    update_balance(self.author_id, bal_now - self.amount)
-                    store_bet(match_page, match_event, team1, team2, self.author_id, team2, self.amount, ctx.channel.id)
 
                     await inter.response.edit_message(
                         content=(
@@ -995,15 +1117,13 @@ async def bet_watcher():
     open_bets = get_open_bets()
     if not open_bets:
         return
-    # Fetch live and recent match data once per run
-    live_data = get_live_score()
-    recent_data = get_recent_match()
-    segments_live = []
-    segments_recent = []
-    if live_data and "data" in live_data and "segments" in live_data["data"]:
-        segments_live = live_data["data"]["segments"]
-    if recent_data and "data" in recent_data and "segments" in recent_data["data"]:
-        segments_recent = recent_data["data"]["segments"]
+    # Fetch both endpoints concurrently and keep blocking HTTP work off the event loop.
+    live_data, recent_data = await asyncio.gather(
+        get_live_score(),
+        get_recent_match(),
+    )
+    segments_live = _extract_segments(live_data)
+    segments_recent = _extract_segments(recent_data)
     # Group bets by normalized match_page
     bets_by_match: Dict[str, List[Dict]] = {}
     for bet in open_bets:
@@ -1039,18 +1159,20 @@ async def bet_watcher():
                 finished_segment = seg
                 break
         if finished_segment:
-            # Parse scores to determine winner
-            s1 = finished_segment.get("score1")
-            s2 = finished_segment.get("score2")
-            try:
-                score1 = int(s1)
-            except (TypeError, ValueError):
-                score1 = 0
-            try:
-                score2 = int(s2)
-            except (TypeError, ValueError):
-                score2 = 0
-            winner_team = finished_segment.get("team1") if score1 >= score2 else finished_segment.get("team2")
+            # Only resolve a completed match when both scores are valid and unequal.
+            score1 = _safe_int(finished_segment.get("score1"), -1)
+            score2 = _safe_int(finished_segment.get("score2"), -1)
+            if score1 < 0 or score2 < 0 or score1 == score2:
+                continue
+
+            winner_team = (
+                finished_segment.get("team1")
+                if score1 > score2
+                else finished_segment.get("team2")
+            )
+            if not isinstance(winner_team, str) or not winner_team:
+                continue
+
             winners, losers = resolve_bets(mp, winner_team)
             # Organize summary per channel
             channel_to_bets: Dict[int, List[Dict]] = {}
@@ -1085,6 +1207,8 @@ async def before_bet_watcher():
     await bot.wait_until_ready()
 
 
-# RUN THE BOT 
+# RUN THE BOT
 if __name__ == "__main__":
-    bot.run(token)
+    if not DISCORD_TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is not set.")
+    bot.run(DISCORD_TOKEN)
